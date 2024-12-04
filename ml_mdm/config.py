@@ -1,6 +1,8 @@
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2024 Apple Inc. All rights reserved.
 
+import json
+
 import simple_parsing
 from simple_parsing.wrappers.field_wrapper import ArgumentGenerationMode
 
@@ -113,6 +115,10 @@ def add_common_arguments(parser):
     )
     parser.add_argument(
         "--num-epochs", type=int, default=20000, help="# of epochs to train for"
+    )
+
+    parser.add_argument(
+        "--lora_ranks", type=json.loads, default=None, help="LoRA ranks for layers"
     )
 
     return parser

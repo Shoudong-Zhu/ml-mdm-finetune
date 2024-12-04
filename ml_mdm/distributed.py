@@ -25,6 +25,7 @@ def setup_for_distributed(is_master):
 
 
 def init_distributed_singlenode(timeout=0):
+    print("Starting distributed training")
     # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
     dist_url = "env://"  # default
 
@@ -41,8 +42,12 @@ def init_distributed_singlenode(timeout=0):
         timeout = datetime.timedelta(seconds=timeout)
 
     logging.info(f"Default timeout: {timeout}")
+    print(
+        f"init_distributed_singlenode: rank {rank} world_size {world_size} init_method {dist_url}"
+    )
     dist.init_process_group(
-        backend="nccl",
+        backend="gloo",
+        # backend="nccl",
         init_method=dist_url,
         world_size=world_size,
         timeout=timeout,
@@ -50,7 +55,12 @@ def init_distributed_singlenode(timeout=0):
     )
 
     # this will make all .cuda() calls work properly
-    torch.cuda.set_device(local_rank)
+    # torch.cuda.set_device(local_rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    else:
+        logging.info("CUDA is not available; using CPU instead.")
+
     # synchronizes all the threads to reach this point before moving on
     dist.barrier()
     logging.info(

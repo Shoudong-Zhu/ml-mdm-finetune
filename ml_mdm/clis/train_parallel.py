@@ -4,6 +4,7 @@
 eg command:
 TORCH_DISTRIBUTED_DEBUG=DETAIL torchrun --nproc_per_node=2 train_parallel.py
 """
+import json
 import logging
 import os
 import time
@@ -17,6 +18,8 @@ from ml_mdm.language_models import factory
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+import warnings
+
 import torchinfo
 
 import torch.distributed as dist
@@ -29,6 +32,8 @@ from ml_mdm.lr_scaler import LRScaler
 from ml_mdm.models.model_ema import ModelEma
 from ml_mdm.reader import convert
 from ml_mdm.utils import simple_logger
+
+warnings.filterwarnings("ignore", message="The IPv6 network addresses")
 
 
 def load_batch(next_sample, device):
@@ -51,15 +56,35 @@ def load_batch(next_sample, device):
 
 def main(args):
     local_rank, global_rank, world_size = init_distributed_singlenode(timeout=36000)
+    # if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+    #     dist.init_process_group(
+    #         backend="nccl" if torch.cuda.is_available() else "gloo",
+    #         init_method="env://",
+    #     )
+    #     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    #     global_rank = dist.get_rank() if dist.is_initialized() else 0
+    #     world_size = dist.get_world_size() if dist.is_initialized() else 1
+    # else:
+    #     local_rank, global_rank, world_size = 0, 0, 1  # No distributed setup
 
     input_channels = 3
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    # device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    # device = torch.device("cpu")
     tokenizer, language_model = factory.create_lm(args, device=device)
     language_model_dim = language_model.embed_dim
 
     args.unet_config.conditioning_feature_dim = language_model_dim
+    print("------------------")
+    print(args.lora_ranks)
+    print(args.output_dir)
+
+    # print(args)
+    print("------------------")
     denoising_model = get_model(args.model)(
-        input_channels, input_channels, args.unet_config
+        input_channels, input_channels, args.unet_config, args.lora_ranks
     ).to(device)
     torchinfo.summary(denoising_model)
     diffusion_model = get_pipeline(args.model)(
@@ -71,7 +96,9 @@ def main(args):
             os.makedirs(args.output_dir)
 
     if "MASTER_ADDR" in os.environ:
-        dist.barrier()
+        # dist.barrier()
+        if dist.is_initialized():
+            dist.barrier()
 
     other_items = None
     if (
@@ -109,7 +136,10 @@ def main(args):
     else:
         grad_scaler = None
 
-    dist.barrier()
+    # dist.barrier()
+    if dist.is_initialized():
+        dist.barrier()
+
     max_lr = args.lr
     # Should eps be 1e-4 like for LMs in fp16 ?
     if args.use_adamw:
@@ -137,13 +167,32 @@ def main(args):
     CLIP = 3
 
     # intialize the model
-    model = nn.parallel.DistributedDataParallel(
-        diffusion_model.model,
-        device_ids=[local_rank],
-    )
+    # model = nn.parallel.DistributedDataParallel(
+    #     diffusion_model.model,
+    #     device_ids=[local_rank],
+    # )
+
+    if dist.is_initialized():
+        model = nn.parallel.DistributedDataParallel(
+            diffusion_model.model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+        )
+    else:
+        model = (
+            diffusion_model.model
+        )  # No distributed wrapper for non-distributed training
+
     diffusion_model.model = model
-    dist.barrier()
-    ema_model = ModelEma(diffusion_model.model.module.vision_model)
+    # dist.barrier()
+    if dist.is_initialized():
+        dist.barrier()
+
+    if dist.is_initialized():
+        ema_model = ModelEma(diffusion_model.model.module.vision_model)
+    else:
+        ema_model = ModelEma(diffusion_model.model.vision_model)
+
+    # ema_model = ModelEma(diffusion_model.model.module.vision_model)
 
     # get the dataloader
     if args.multinode:
@@ -279,7 +328,9 @@ def main(args):
                 )
 
         if (batch_num % args.save_freq == 0) or (batch_num == args.num_training_steps):
-            dist.barrier()
+            # dist.barrier()
+            if dist.is_initialized():
+                dist.barrier()
 
         if batch_num == args.num_training_steps:
             break

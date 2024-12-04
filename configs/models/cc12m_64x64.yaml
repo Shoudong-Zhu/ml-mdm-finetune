@@ -41,14 +41,14 @@ text_model: google/flan-t5-xl
 vision_model: unet
 
 unet_config:
-  num_resnets_per_resolution: [2, 2, 2]
+  num_resnets_per_resolution: [1, 1, 1]
   attention_levels: [1, 2]
   num_attention_layers: [0, 1, 5]
   conditioning_feature_dim: -1
   conditioning_feature_proj_dim: 2048
   num_lm_head_layers: 0
   masked_cross_attention: 0
-  resolution_channels: [256, 512, 768]
+  resolution_channels: [128, 256, 384]
   skip_mid_blocks: False
   skip_cond_emb: False
   nesting: False
@@ -86,6 +86,18 @@ reader_config:
   max_caption_length: 512
   max_token_length: 128
   num_readers: 16
+
+lora_ranks:
+  conv_in: 4
+  conv_out: 4
+  conv1: 4
+  conv2: 4
+  conv3: 4
+  qkv: 4
+  proj_out: 4
+  kv_cond: 4
+  ffn_1: 4
+  ffn_3: 4
 
 metrics: fid,clip
 batch_size: 32

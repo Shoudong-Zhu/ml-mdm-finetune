@@ -1,0 +1,8 @@
+dataset:
+  type: Flickr30k
+  tar_paths:
+    - flickr30k_train.tar
+  index_file: flickr30k_train.tsv
+  validation_tar_paths:
+    - flickr30k_validation.tar
+  validation_index_file: flickr30k_validation.tsv

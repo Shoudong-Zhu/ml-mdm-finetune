@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ml_mdm import config
+from ml_mdm.models.lora_custom import LoRA
 from ml_mdm.utils import fix_old_checkpoints
 
 
@@ -39,6 +40,20 @@ def zero_module(module):
     for p in module.parameters():
         p.detach().zero_()
     return module
+
+
+def apply_lora(module, lora_ranks):
+    """
+    Apply LoRA to specified layers within the module.
+    Args:
+        module: The nn.Module where LoRA will be applied.
+        lora_ranks: A dictionary specifying LoRA ranks for specific layers.
+    """
+    for name, sub_module in module.named_modules():
+        if isinstance(sub_module, (nn.Linear, nn.Conv2d)) and name in lora_ranks:
+            rank = lora_ranks[name]
+            lora_layer = LoRA(sub_module, rank=rank)
+            setattr(module, name, lora_layer)
 
 
 @dataclass
@@ -190,9 +205,39 @@ def temporal_wrapper(f):
     return wrapper
 
 
+# class ResNet(nn.Module):
+#     def __init__(self, time_emb_channels, config: ResNetConfig):
+#         # TODO(ndjaitly): What about scales of weights.
+#         super(ResNet, self).__init__()
+#         self.config = config
+#         self.norm1 = nn.GroupNorm(config.num_groups_norm, config.num_channels)
+#         self.conv1 = nn.Conv2d(
+#             config.num_channels,
+#             config.output_channels,
+#             kernel_size=3,
+#             padding=1,
+#             bias=True,
+#         )
+#         self.time_layer = nn.Linear(time_emb_channels, config.output_channels * 2)
+#         self.norm2 = nn.GroupNorm(config.num_groups_norm, config.output_channels)
+#         self.dropout = nn.Dropout(config.dropout)
+#         self.conv2 = zero_module(
+#             nn.Conv2d(
+#                 config.output_channels,
+#                 config.output_channels,
+#                 kernel_size=3,
+#                 padding=1,
+#                 bias=True,
+#             )
+#         )
+#         if self.config.output_channels != self.config.num_channels:
+#             self.conv3 = nn.Conv2d(
+#                 config.num_channels, config.output_channels, kernel_size=1, bias=True
+#             )
+
+
 class ResNet(nn.Module):
-    def __init__(self, time_emb_channels, config: ResNetConfig):
-        # TODO(ndjaitly): What about scales of weights.
+    def __init__(self, time_emb_channels, config: ResNetConfig, lora_ranks=None):
         super(ResNet, self).__init__()
         self.config = config
         self.norm1 = nn.GroupNorm(config.num_groups_norm, config.num_channels)
@@ -203,7 +248,13 @@ class ResNet(nn.Module):
             padding=1,
             bias=True,
         )
+        if lora_ranks and "conv1" in lora_ranks:
+            self.conv1 = LoRA(self.conv1, rank=lora_ranks["conv1"], alpha=32)
+
         self.time_layer = nn.Linear(time_emb_channels, config.output_channels * 2)
+        if lora_ranks and "time_layer" in lora_ranks:
+            self.time_layer = LoRA(self.time_layer, rank=lora_ranks["time_layer"])
+
         self.norm2 = nn.GroupNorm(config.num_groups_norm, config.output_channels)
         self.dropout = nn.Dropout(config.dropout)
         self.conv2 = zero_module(
@@ -215,10 +266,15 @@ class ResNet(nn.Module):
                 bias=True,
             )
         )
+        if lora_ranks and "conv2" in lora_ranks:
+            self.conv2 = LoRA(self.conv2, rank=lora_ranks["conv2"], alpha=32)
+
         if self.config.output_channels != self.config.num_channels:
             self.conv3 = nn.Conv2d(
                 config.num_channels, config.output_channels, kernel_size=1, bias=True
             )
+            if lora_ranks and "conv3" in lora_ranks:
+                self.conv3 = LoRA(self.conv3, rank=lora_ranks["conv3"], alpha=32)
 
     def forward(self, x, temb):
         h = F.silu(self.norm1(x))
@@ -246,6 +302,7 @@ class SelfAttention(nn.Module):
         num_head_channels=-1,
         cond_dim=None,
         use_attention_ffn=False,
+        lora_ranks=None,  # Add LoRA ranks
     ):
         super().__init__()
         self.channels = channels
@@ -256,13 +313,23 @@ class SelfAttention(nn.Module):
                 channels % num_head_channels == 0
             ), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
             self.num_heads = channels // num_head_channels
+
         self.norm = nn.GroupNorm(32, channels)
         self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        if lora_ranks and "qkv" in lora_ranks:
+            self.qkv = LoRA(self.qkv, rank=lora_ranks["qkv"])  # Wrap with LoRA
+
         self.cond_dim = cond_dim
         if cond_dim is not None and cond_dim > 0:
             self.norm_cond = nn.LayerNorm(cond_dim)
             self.kv_cond = nn.Linear(cond_dim, channels * 2)
+            if lora_ranks and "kv_cond" in lora_ranks:
+                self.kv_cond = LoRA(self.kv_cond, rank=lora_ranks["kv_cond"])  # LoRA
+
         self.proj_out = zero_module(nn.Conv2d(channels, channels, 1))
+        if lora_ranks and "proj_out" in lora_ranks:
+            self.proj_out = LoRA(self.proj_out, rank=lora_ranks["proj_out"])  # LoRA
+
         if use_attention_ffn:
             self.ffn = nn.Sequential(
                 nn.GroupNorm(32, channels),
@@ -270,6 +337,9 @@ class SelfAttention(nn.Module):
                 nn.GELU(),
                 zero_module(nn.Conv2d(4 * channels, channels, 1)),
             )
+            if lora_ranks and "ffn" in lora_ranks:
+                self.ffn[1] = LoRA(self.ffn[1], rank=lora_ranks["ffn_1"])
+                self.ffn[3] = LoRA(self.ffn[3], rank=lora_ranks["ffn_3"])
         else:
             self.ffn = None
 
@@ -294,9 +364,7 @@ class SelfAttention(nn.Module):
         return a.reshape(bs, -1, length)
 
     def forward(self, x, cond=None, cond_mask=None):
-        # assert (self.cond_dim is not None) == (cond is not None)
         b, c, *spatial = x.shape
-        # x = x.reshape(b, c, -1)
         qkv = self.qkv(self.norm(x))
         q, k, v = qkv.reshape(b, 3 * c, -1).chunk(3, dim=1)
         h = self.attention(q, k, v)
@@ -460,6 +528,7 @@ class ResNetBlock(nn.Module):
         temporal_pos_emb: bool = False,
         temporal_spatial_ds: bool = False,
         num_temporal_attention_layers: int = None,
+        lora_ranks=None,
     ):
         super().__init__()
         resnets = []
@@ -474,20 +543,21 @@ class ResNetBlock(nn.Module):
 
         for i in range(num_residual_blocks):
             cur_config = resnet_configs[i]
-            resnets.append(ResNet(temporal_dim, cur_config))
+            resnets.append(ResNet(temporal_dim, cur_config, lora_ranks=lora_ranks))
         self.resnets = nn.ModuleList(resnets)
 
         if self.num_attention_layers > 0:
             attn = []
             for i in range(num_residual_blocks):
                 for j in range(self.num_attention_layers):
-                    attn.append(
-                        SelfAttention(
-                            resnet_configs[i].output_channels,
-                            cond_dim=conditioning_feature_dim,
-                            use_attention_ffn=resnet_configs[i].use_attention_ffn,
-                        )
+                    attn_layer = SelfAttention(
+                        resnet_configs[i].output_channels,
+                        cond_dim=conditioning_feature_dim,
+                        use_attention_ffn=resnet_configs[i].use_attention_ffn,
                     )
+                    # if lora_ranks and "attention" in lora_ranks:
+                    # attn_layer = LoRA(attn_layer, rank=lora_ranks["attention"])
+                    attn.append(attn_layer)
             self.attn = nn.ModuleList(attn)
 
         if (
@@ -498,14 +568,16 @@ class ResNetBlock(nn.Module):
             t_attn = []
             for i in range(num_residual_blocks):
                 for j in range(self.num_temporal_attention_layers):
-                    t_attn.append(
-                        TemporalAttentionBlock(
-                            resnet_configs[i].output_channels,
-                            num_head_channels=32,
-                            down=True,
-                            pos_emb=temporal_pos_emb,
-                        )
+                    t_attn_layer = TemporalAttentionBlock(
+                        resnet_configs[i].output_channels,
+                        num_head_channels=32,
+                        down=True,
+                        pos_emb=temporal_pos_emb,
                     )
+                    # Apply LoRA to temporal attention if specified
+                    # if lora_ranks and "temporal_attention" in lora_ranks:
+                    # t_attn_layer = LoRA(t_attn_layer, rank=lora_ranks["temporal_attention"])
+                    t_attn.append(t_attn_layer)
             self.t_attn = nn.ModuleList(t_attn)
 
         conv_layer = (
@@ -521,6 +593,9 @@ class ResNetBlock(nn.Module):
                 bias=True,
             )
 
+            if lora_ranks and "resample_down" in lora_ranks:
+                self.resample = LoRA(self.resample, rank=lora_ranks["resample_down"])
+
         elif self.upsample_output:
             self.resample = conv_layer(
                 resnet_configs[-1].output_channels,
@@ -530,6 +605,8 @@ class ResNetBlock(nn.Module):
                 padding=1,
                 bias=True,
             )
+            if lora_ranks and "resample_up" in lora_ranks:
+                self.resample = LoRA(self.resample, rank=lora_ranks["resample_up"])
 
     def forward(
         self,
@@ -578,8 +655,11 @@ class ResNetBlock(nn.Module):
 
 @config.register_model("unet")
 class UNet(nn.Module):
-    def __init__(self, input_channels, output_channels, config: UNetConfig):
+    def __init__(
+        self, input_channels, output_channels, config: UNetConfig, lora_ranks=None
+    ):
         super().__init__()
+        self.lora_ranks = lora_ranks
         self.down_blocks = []
         self.config = config
         self.input_channels = input_channels
@@ -632,6 +712,9 @@ class UNet(nn.Module):
         self.conv_in = nn.Conv2d(
             input_channels, channels, kernel_size=3, stride=1, padding=1, bias=True
         )
+        if lora_ranks and "conv_in" in lora_ranks:
+            self.conv_in = LoRA(self.conv_in, rank=lora_ranks["conv_in"])
+
         skip_channels = [channels]
         num_resolutions = len(config.resolution_channels)
         self.num_resolutions = num_resolutions
@@ -676,6 +759,7 @@ class UNet(nn.Module):
                     temporal_pos_emb=config.temporal_positional_encoding,
                     temporal_spatial_ds=config.temporal_spatial_ds,
                     num_temporal_attention_layers=num_temporal_attention_layers,
+                    lora_ranks=lora_ranks,
                 )
             )
             channels = resnet_config.output_channels
@@ -750,6 +834,8 @@ class UNet(nn.Module):
         self.conv_out = zero_module(
             nn.Conv2d(channels, output_channels, kernel_size=3, padding=1)
         )
+        if lora_ranks and "conv_out" in lora_ranks:
+            self.conv_out = LoRA(self.conv_out, rank=lora_ranks["conv_out"])
         self._config = config
         self.down_blocks = nn.ModuleList(self.down_blocks)
         if not config.skip_mid_blocks:
